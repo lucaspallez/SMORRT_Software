@@ -30,7 +30,8 @@ Board configuration: Teensy 4.1
 - Standard Arduino Libraries
 - [Adafruit BMP280 Library](https://github.com/adafruit/Adafruit_BMP280_Library)
 - [Adafruit MPU6050 Library](https://github.com/adafruit/Adafruit_MPU6050)
-- [RadioHead Library](http://www.airspayce.com/mikem/arduino/RadioHead/)
+- [RadioHead Library (Teensy Compatible)](https://github.com/PaulStoffregen/RadioHead)
 - [TinyGPS++ Library](http://arduiniana.org/libraries/tinygpsplus/)
 
+Libraries that are not included in PlatformIO shall be added to the PlatformIO lib folder.
 TO COMPLETE
