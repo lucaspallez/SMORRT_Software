@@ -373,7 +373,7 @@ void BMP_read(void) {
 
 void lora_packet_build(void) {
 
-  uint8_t *temp_buffer;
+  uint8_t temp_buffer[sizeof(float)];
 
   // Timestamp
   memcpy(temp_buffer, &(temp.timestamp), sizeof(float));
