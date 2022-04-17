@@ -44,21 +44,22 @@
 #define VBATT_12V             (29)
 
 // LoRa Defines
-#define LORA_PACKET_SIZE      (84)      // bytes
-#define LORA_FREQ             (868.0)   // MHz
+#define LORA_PACKET_SIZE      (84)        // bytes
+#define LORA_FREQ             (868.0)     // MHz
 #define LORA_SF               (9)
 
-#define LOCAL_PRESSURE        (1013.25) // hPa
+#define LOCAL_PRESSURE        (1013.25)   // hPa
 
-// Safety Timer Defines
-#define EVENT_1_TIMER         (0)        // s
-#define EVENT_2_TIMER         (0)        // s
-#define MACH_DELAY            (0)        // s
+// Flight Parameters
+#define EVENT_1_TIMER         (0)         // seconds
+#define EVENT_2_TIMER         (0)         // seconds
+#define EVENT_2_ALT           (0)          // meters
 
 // Threshold and Delay Defines
+#define LIFTOFF_THRESHOLD     (3)         // g's
+#define LIFTOFF_DELAY         (500)       // milliseconds
+#define MACH_DELAY            (0)         // seconds
 
-#define LIFTOFF_THRESHOLD     (3)       // g
-#define LIFTOFF_DELAY         (100)    //millis
 
 // ======================================================== Hardware Interfaces ========================================================
 // LoRa: SPI1
@@ -154,6 +155,7 @@ uint8_t liftoff_delay = false;
 uint32_t liftoff_timer = 0;
 uint8_t liftoff_status = 0;
 uint8_t apogee_status = 0;
+uint8_t touchdown_status = 0;
 uint8_t first_execute = true;
 uint8_t logging_enable = false;
 
@@ -182,6 +184,7 @@ void safety_timer_event_1_handle(void);
 void safety_timer_event_2_handle(void);
 uint8_t liftoff_detect(void);
 uint8_t apogee_detect(void);
+uint8_t touchdown_detect(void);
 void ematch_test(void);
 void ematch_arm(void);
 void ematch_disarm(void);
@@ -193,7 +196,6 @@ static void printInt(unsigned long val, bool valid, int len);
 static void printFloat(float val, bool valid, int len, int prec);
 static void smartDelay(unsigned long ms);
 void logData(void);
-
 
 // ======================================================== Setup ========================================================
 void setup() {
@@ -258,7 +260,6 @@ void setup() {
   Serial.println("SMORRT Ready for flight.");
 }
 
-
 // ======================================================== Loop ========================================================
 void loop() {
 
@@ -285,7 +286,6 @@ void loop() {
   heartbeat();
   delay(1000);  
 }
-
 
 // ======================================================== Functions ========================================================
 void heartbeat(void) {
@@ -585,17 +585,29 @@ void state_update(void){
       break;
     case B_ASCENT:
       //apogee detection or safety timer -> current_state = EVENT_1
+      if(apogee_detect()){
+        current_state = EVENT_1;
+      }
       first_execute = true;
       break;
     case EVENT_1:
-      ematch_trigger(EMATCH_1);
-      ematch_trigger(EMATCH_2);
+      if(first_execute){
+        ematch_trigger(EMATCH_1);
+        ematch_trigger(EMATCH_2);
+        first_execute = false;
+      }
       //altitude detection + safety timer -> current_state = EVENT_2
+      if(est_altitude < EVENT_2_ALT){
+        current_state = EVENT_2;
+      }
       first_execute = true;
       break;
     case EVENT_2:
-      ematch_trigger(EMATCH_3);
-      ematch_trigger(EMATCH_4);
+      if(first_execute){
+        ematch_trigger(EMATCH_3);
+        ematch_trigger(EMATCH_4);
+        first_execute = false;
+      }
       //no movement for a bit -> current_state = TOUCHDOWN
       first_execute = true;
       break;
@@ -612,9 +624,12 @@ void state_update(void){
 }
 
 void safety_timer_event_1_handle(void){
+  current_state = EVENT_1;
 }
 
 void safety_timer_event_2_handle(void){
+  current_state = EVENT_2;
+
 }
 
 uint8_t liftoff_detect(void){
@@ -635,6 +650,11 @@ uint8_t liftoff_detect(void){
 uint8_t apogee_detect(void){
 
   return apogee_status;
+}
+
+uint8_t touchdown_detect(void){
+
+  return touchdown_status;
 }
 
 void ematch_test(void){
