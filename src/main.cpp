@@ -46,8 +46,9 @@
 #define VBATT_12V             (29)
 
 // LoRa Defines
-#define LORA_PACKET_SIZE      (24)
+#define LORA_PACKET_SIZE      (25)
 #define LORA_FREQ             (868.0)
+#define LORA_SF               (9)
 
 #define LOCAL_PRESSURE        (1013.25)
 
@@ -69,13 +70,13 @@
 // State 6: EVENT_2
 // State 7: TOUCHDOWN
 
-#define IDLE              (1)
-#define ARMED             (2)
-#define P_ASCENT          (3)
-#define B_ASCENT          (4)
-#define EVENT_1           (5)
-#define EVENT_2           (6)
-#define TOUCHDOWN         (7)
+#define IDLE                  (1)
+#define ARMED                 (2)
+#define P_ASCENT              (3)
+#define B_ASCENT              (4)
+#define EVENT_1               (5)
+#define EVENT_2               (6)
+#define TOUCHDOWN             (7)
 
 // ======================================================== Global Variables ========================================================
 
@@ -84,7 +85,7 @@ File myFile;
 
 // LoRa Variables
 RH_RF95 rf95(TE_CS_PIN, TE_INT_PIN, hardware_spi1);
-uint8_t lora_packet[LORA_PACKET_SIZE];
+uint8_t lora_packet[RH_RF95_MAX_MESSAGE_LEN];
 
 
 // MPU Variables
@@ -110,6 +111,44 @@ uint8_t ematch_1_status;
 uint8_t ematch_2_status;
 uint8_t ematch_3_status;
 uint8_t ematch_4_status;
+
+//Sensor Variables
+struct ACCEL
+{
+  float x;
+  float y;
+  float z;
+};
+struct GYRO
+{
+  float x;
+  float y;
+  float z;
+};
+struct TEMP
+{
+  float mpu;
+  float bmp;
+};
+struct GPS
+{
+  float sats;
+  float hdop;
+  float longitude;
+  float latitude;
+  float altitude;
+  float speed;
+};
+
+ACCEL accel_data;
+GYRO gyro_data;
+TEMP temp_data;
+GPS gps_data;
+float pressure;
+float est_altitude;
+
+
+
 
 
 // ======================================================== Function Prototypes ========================================================
@@ -176,6 +215,7 @@ void setup() {
     Serial.println("init failed");
   rf95.setTxPower(12, false);
   rf95.setFrequency(LORA_FREQ);
+  rf95.setSpreadingFactor(LORA_SF);
 
   // GPS Init
   Serial.println(F("Testing TinyGPSPlus library"));
@@ -186,15 +226,20 @@ void setup() {
   // Sensor init
   MPU_init();
   BMP_init();
+
+  // Safety Ematch Disarm
   ematch_disarm();
 
+  // SD Init
   Serial.print("Initializing SD card...");
-
   if (!SD.begin(BUILTIN_SDCARD)) {
     Serial.println("initialization failed!");
     return;
   }
-  Serial.println("initialization done.");
+
+  Serial.println("Initialization Complete.");
+  Serial.println("SMORRT Ready for flight.");
+
   
 }
 
@@ -202,15 +247,19 @@ void setup() {
 // ======================================================== Loop ========================================================
 void loop() {
 
+  // Data Acquisition Handle
   MPU_read();
   BMP_read();
   GPS_read();
-
   battery_level_read();
   //TODO Moyenne mobile
-  state_update();
   //TODO Recovery event triggering/arming/testing
   ematch_test();
+
+  // State Machine Handle
+  state_update();
+
+  // LoRa Handle
   lora_packet_build();
   lora_tx_handle();
 
@@ -250,24 +299,33 @@ void MPU_init(void) {
 
 void MPU_read(void) {
   mpu.getEvent(&a, &g, &temp);
+
+  accel_data.x = a.acceleration.x;
+  accel_data.y = a.acceleration.y;
+  accel_data.z = a.acceleration.z;
+  gyro_data.x = g.gyro.x;
+  gyro_data.y = g.gyro.y;
+  gyro_data.z = g.gyro.z;
+  temp_data.mpu = temp.temperature;
+
   Serial.print("Acceleration X: ");
-  Serial.print(a.acceleration.x);
+  Serial.print(accel_data.x);
   Serial.print(", Y: ");
-  Serial.print(a.acceleration.y);
+  Serial.print(accel_data.y);
   Serial.print(", Z: ");
-  Serial.print(a.acceleration.z);
+  Serial.print(accel_data.z);
   Serial.println(" m/s^2");
 
   Serial.print("Rotation X: ");
-  Serial.print(g.gyro.x);
+  Serial.print(gyro_data.x);
   Serial.print(", Y: ");
-  Serial.print(g.gyro.y);
+  Serial.print(gyro_data.y);
   Serial.print(", Z: ");
-  Serial.print(g.gyro.z);
+  Serial.print(gyro_data.z);
   Serial.println(" rad/s");
 
   Serial.print("Temperature: ");
-  Serial.print(temp.temperature);
+  Serial.print(temp_data.mpu);
   Serial.println(" degC");
 
   Serial.println("");
@@ -292,9 +350,14 @@ void BMP_init(void) {
 }
 
 void BMP_read(void) {
+
+  temp_data.bmp = bmp.readTemperature();
+  pressure = bmp.readPressure();
+  est_altitude = bmp.readAltitude(LOCAL_PRESSURE);
+
   Serial.print(F("Temperature = "));
   Serial.print(bmp.readTemperature());
-  Serial.println(" *C");
+  Serial.println(" °C");
 
   Serial.print(F("Pressure = "));
   Serial.print(bmp.readPressure());
@@ -310,43 +373,125 @@ void BMP_read(void) {
 
 void lora_packet_build(void) {
 
+  uint8_t *temp_buffer;
+
   // Timestamp
-  lora_packet[0] = temp.timestamp;
+  memcpy(temp_buffer, &(temp.timestamp), sizeof(float));
+  lora_packet[0] = temp_buffer[0];
+  lora_packet[1] = temp_buffer[1];
+  lora_packet[2] = temp_buffer[2];
+  lora_packet[3] = temp_buffer[3];
 
   // IMU Data
-  lora_packet[1] = a.acceleration.x;
-  lora_packet[2] = a.acceleration.y;
-  lora_packet[3] = a.acceleration.z;
-  lora_packet[4] = a.gyro.x;
-  lora_packet[5] = a.gyro.y;
-  lora_packet[6] = a.gyro.z;
+  memcpy(temp_buffer, &(accel_data.x), sizeof(float));
+  lora_packet[4] = temp_buffer[0];
+  lora_packet[5] = temp_buffer[1];
+  lora_packet[6] = temp_buffer[2];
+  lora_packet[7] = temp_buffer[3];
+  memcpy(temp_buffer, &(accel_data.y), sizeof(float));
+  lora_packet[8] = temp_buffer[0];
+  lora_packet[9] = temp_buffer[1];
+  lora_packet[10] = temp_buffer[2];
+  lora_packet[11] = temp_buffer[3];
+  memcpy(temp_buffer, &(accel_data.z), sizeof(float));
+  lora_packet[12] = temp_buffer[0];
+  lora_packet[13] = temp_buffer[1];
+  lora_packet[14] = temp_buffer[2];
+  lora_packet[15] = temp_buffer[3];
+  memcpy(temp_buffer, &(gyro_data.x), sizeof(float));
+  lora_packet[16] = temp_buffer[0];
+  lora_packet[17] = temp_buffer[1];
+  lora_packet[18] = temp_buffer[2];
+  lora_packet[19] = temp_buffer[3];
+  memcpy(temp_buffer, &(gyro_data.y), sizeof(float));
+  lora_packet[20] = temp_buffer[0];
+  lora_packet[21] = temp_buffer[1];
+  lora_packet[22] = temp_buffer[2];
+  lora_packet[23] = temp_buffer[3];
+  memcpy(temp_buffer, &(gyro_data.z), sizeof(float));
+  lora_packet[24] = temp_buffer[0];
+  lora_packet[25] = temp_buffer[1];
+  lora_packet[26] = temp_buffer[2];
+  lora_packet[27] = temp_buffer[3];
 
   // Baro Data
-  lora_packet[7] = temp.temperature;
-  lora_packet[8] = bmp.readTemperature();
-  lora_packet[9] = bmp.readPressure();
-  lora_packet[10] = bmp.readAltitude(LOCAL_PRESSURE);
+  memcpy(temp_buffer, &(temp_data.mpu), sizeof(float));
+  lora_packet[28] = temp_buffer[0];
+  lora_packet[29] = temp_buffer[1];
+  lora_packet[30] = temp_buffer[2];
+  lora_packet[31] = temp_buffer[3];
+  memcpy(temp_buffer, &(temp_data.bmp), sizeof(float));
+  lora_packet[32] = temp_buffer[0];
+  lora_packet[33] = temp_buffer[1];
+  lora_packet[34] = temp_buffer[2];
+  lora_packet[35] = temp_buffer[3];
+  memcpy(temp_buffer, &pressure, sizeof(float));
+  lora_packet[36] = temp_buffer[0];
+  lora_packet[37] = temp_buffer[1];
+  lora_packet[38] = temp_buffer[2];
+  lora_packet[39] = temp_buffer[3];
+  memcpy(temp_buffer, &est_altitude, sizeof(float));
+  lora_packet[40] = temp_buffer[0];
+  lora_packet[41] = temp_buffer[1];
+  lora_packet[42] = temp_buffer[2];
+  lora_packet[43] = temp_buffer[3];
 
   // Battery Levels
-  lora_packet[11] = v_batt1;
-  lora_packet[12] = v_batt2;
-  lora_packet[13] = v_batt_12V;
+  memcpy(temp_buffer, &v_batt1, sizeof(float));
+  lora_packet[44] = temp_buffer[0];
+  lora_packet[45] = temp_buffer[1];
+  lora_packet[46] = temp_buffer[2];
+  lora_packet[47] = temp_buffer[3];
+  memcpy(temp_buffer, &v_batt2, sizeof(float));
+  lora_packet[48] = temp_buffer[0];
+  lora_packet[49] = temp_buffer[1];
+  lora_packet[50] = temp_buffer[2];
+  lora_packet[51] = temp_buffer[3];
+  memcpy(temp_buffer, &v_batt_12V, sizeof(float));
+  lora_packet[52] = temp_buffer[0];
+  lora_packet[53] = temp_buffer[1];
+  lora_packet[54] = temp_buffer[2];
+  lora_packet[55] = temp_buffer[3];
 
   // Status
-  lora_packet[14] = current_state;
-  lora_packet[15] = ematch_1_status;
-  lora_packet[16] = ematch_2_status;
-  lora_packet[17] = ematch_3_status;
-  lora_packet[18] = ematch_4_status;
+  lora_packet[56] = current_state;
+  lora_packet[57] = ematch_1_status;
+  lora_packet[58] = ematch_2_status;
+  lora_packet[59] = ematch_3_status;
+  lora_packet[60] = ematch_4_status;
 
   // GPS Data
-  lora_packet[19] = gps.satellites.value();
-  lora_packet[20] = gps.location.lng();
-  lora_packet[21] = gps.location.lat();
-  lora_packet[22] = gps.altitude.meters();
-  lora_packet[23] = gps.speed.kmph();
-
-  // data conversion on all variables
+  memcpy(temp_buffer, &(gps_data.sats), sizeof(float));
+  lora_packet[61] = temp_buffer[0];
+  lora_packet[62] = temp_buffer[1];
+  lora_packet[63] = temp_buffer[2];
+  lora_packet[64] = temp_buffer[3];
+  memcpy(temp_buffer, &(gps_data.hdop), sizeof(float));
+  lora_packet[65] = temp_buffer[0];
+  lora_packet[66] = temp_buffer[1];
+  lora_packet[67] = temp_buffer[2];
+  lora_packet[68] = temp_buffer[3];
+  memcpy(temp_buffer, &(gps_data.longitude), sizeof(float));
+  lora_packet[69] = temp_buffer[0];
+  lora_packet[70] = temp_buffer[1];
+  lora_packet[71] = temp_buffer[2];
+  lora_packet[72] = temp_buffer[3];
+  memcpy(temp_buffer, &(gps_data.latitude), sizeof(float));
+  lora_packet[73] = temp_buffer[0];
+  lora_packet[74] = temp_buffer[1];
+  lora_packet[75] = temp_buffer[2];
+  lora_packet[76] = temp_buffer[3];
+  memcpy(temp_buffer, &(gps_data.altitude), sizeof(float));
+  lora_packet[77] = temp_buffer[0];
+  lora_packet[78] = temp_buffer[1];
+  lora_packet[79] = temp_buffer[2];
+  lora_packet[80] = temp_buffer[3];
+  memcpy(temp_buffer, &(gps_data.speed), sizeof(float));
+  lora_packet[81] = temp_buffer[0];
+  lora_packet[82] = temp_buffer[1];
+  lora_packet[83] = temp_buffer[2];
+  lora_packet[84] = temp_buffer[3];
+ 
 }
 
 void lora_tx_handle(){
@@ -455,6 +600,14 @@ void battery_level_read(void){
 void GPS_read(void){
   static const double CERNIER_LAT = 47.051906, CERNIER_LON = 6.916414;
   digitalWrite(GPS_RX_LED_PIN, HIGH);
+
+  gps_data.sats = gps.satellites.value();
+  gps_data.hdop = gps.hdop.value();
+  gps_data.longitude = gps.location.lng();
+  gps_data.latitude = gps.location.lat();
+  gps_data.altitude = gps.altitude.meters();
+  gps_data.speed = gps.speed.mps();
+
   printInt(gps.satellites.value(), gps.satellites.isValid(), 5);
   printFloat(gps.hdop.hdop(), gps.hdop.isValid(), 6, 1);
   printFloat(gps.location.lat(), gps.location.isValid(), 11, 6);
@@ -579,6 +732,8 @@ static void printStr(const char *str, int len)
   smartDelay(0);
 }
 
+
+
 void logData() {
   // open the file. note that only one file can be open at a time,
   // so you have to close this one before opening another.
@@ -587,52 +742,52 @@ void logData() {
   // if the file opened okay, write to it:
   if (myFile) {
     myFile.print(temp.timestamp);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(a.acceleration.x);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(a.acceleration.y);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(a.acceleration.z);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(a.gyro.x);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(a.gyro.y);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(a.gyro.z);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(temp.temperature);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(bmp.readTemperature());
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(bmp.readPressure());
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(bmp.readAltitude(LOCAL_PRESSURE));
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(v_batt1);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(v_batt2);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(v_batt_12V);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(current_state);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(ematch_1_status);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(ematch_2_status);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(ematch_3_status);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(ematch_4_status);
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(gps.satellites.value());
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(gps.location.lng());
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(gps.location.lat());
-    myFile.print(" , ");
+    myFile.print(" ; ");
     myFile.print(gps.altitude.meters());
-    myFile.print(" , ");
-    myFile.print(gps.speed.kmph());
+    myFile.print(" ; ");
+    myFile.print(gps.speed.mps());
     myFile.println("");
     // close the file:
     myFile.close();
