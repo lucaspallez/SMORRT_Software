@@ -10,8 +10,6 @@
 //#include "SdFat.h"
 #include <SD.h>
 
-
-
 // ======================================================== Defines ========================================================
 // Status Indicator Pins
 #define STATUS_LED_PIN        (6)
@@ -40,20 +38,29 @@
 #define EMATCH_3              (30)
 #define EMATCH_4              (33)
 
-//V_Batt Pins
+// V_Batt Pins
 #define VBATT1                (21)
 #define VBATT2                (22)
 #define VBATT_12V             (29)
 
 // LoRa Defines
-#define LORA_PACKET_SIZE      (25)
-#define LORA_FREQ             (868.0)
+#define LORA_PACKET_SIZE      (84)      // bytes
+#define LORA_FREQ             (868.0)   // MHz
 #define LORA_SF               (9)
 
-#define LOCAL_PRESSURE        (1013.25)
+#define LOCAL_PRESSURE        (1013.25) // hPa
+
+// Safety Timer Defines
+#define EVENT_1_TIMER         (0)        // s
+#define EVENT_2_TIMER         (0)        // s
+#define MACH_DELAY            (0)        // s
+
+// Threshold and Delay Defines
+
+#define LIFTOFF_THRESHOLD     (3)       // g
+#define LIFTOFF_DELAY         (100)    //millis
 
 // ======================================================== Hardware Interfaces ========================================================
-
 // LoRa: SPI1
 // GPS: UART8
 // FRAM: I2C2
@@ -61,7 +68,6 @@
 // IMU: I2C0
 
 // ======================================================== State Machine ========================================================
-
 // State 1: IDLE
 // State 2: ARMED
 // State 3: P_ASCENT
@@ -78,41 +84,7 @@
 #define EVENT_2               (6)
 #define TOUCHDOWN             (7)
 
-// ======================================================== Global Variables ========================================================
-
-// SDFat Variables
-File myFile;
-
-// LoRa Variables
-RH_RF95 rf95(TE_CS_PIN, TE_INT_PIN, hardware_spi1);
-uint8_t lora_packet[RH_RF95_MAX_MESSAGE_LEN];
-
-
-// MPU Variables
-Adafruit_MPU6050 mpu;
-sensors_event_t a, g, temp;
-
-// BMP Variables
-Adafruit_BMP280 bmp(BMP_CS);
-
-// GPS Variables
-TinyGPSPlus gps;
-
-//State Machine Variables
-uint8_t current_state = 0;
-
-//Battery Levels
-float v_batt1;
-float v_batt2;
-float v_batt_12V;
-
-// Ematch Variables
-uint8_t ematch_1_status;
-uint8_t ematch_2_status;
-uint8_t ematch_3_status;
-uint8_t ematch_4_status;
-
-//Sensor Variables
+// ======================================================== Structures ========================================================
 struct ACCEL
 {
   float x;
@@ -140,16 +112,58 @@ struct GPS
   float speed;
 };
 
+// ======================================================== Global Variables ========================================================
+// SDFat Variables
+File myFile;
+
+// LoRa Variables
+RH_RF95 rf95(TE_CS_PIN, TE_INT_PIN, hardware_spi1);
+uint8_t lora_packet[RH_RF95_MAX_MESSAGE_LEN];
+
+// MPU Variables
+Adafruit_MPU6050 mpu;
+sensors_event_t a, g, temp;
+
+// BMP Variables
+Adafruit_BMP280 bmp(BMP_CS);
+
+// GPS Variables
+TinyGPSPlus gps;
+
+//State Machine Variables
+uint8_t current_state = 0;
+
+//Battery Levels
+float v_batt1;
+float v_batt2;
+float v_batt_12V;
+
+// Ematch Variables
+uint8_t ematch_1_status;
+uint8_t ematch_2_status;
+uint8_t ematch_3_status;
+uint8_t ematch_4_status;
+
+// Timers
+IntervalTimer timer_event_1;
+IntervalTimer timer_event_2;
+IntervalTimer timer_misc;
+
+// Misc. Variables
+uint8_t liftoff_delay = false;
+uint32_t liftoff_timer = 0;
+uint8_t liftoff_status = 0;
+uint8_t apogee_status = 0;
+uint8_t first_execute = true;
+uint8_t logging_enable = false;
+
+// Sensor Variables
 ACCEL accel_data;
 GYRO gyro_data;
 TEMP temp_data;
 GPS gps_data;
 float pressure;
 float est_altitude;
-
-
-
-
 
 // ======================================================== Function Prototypes ========================================================
 void heartbeat(void);
@@ -164,6 +178,10 @@ void sendByte(byte b);
 void sendPacket(byte *packet, byte len);
 void GPS_read(void);
 void state_update(void);
+void safety_timer_event_1_handle(void);
+void safety_timer_event_2_handle(void);
+uint8_t liftoff_detect(void);
+uint8_t apogee_detect(void);
 void ematch_test(void);
 void ematch_arm(void);
 void ematch_disarm(void);
@@ -209,7 +227,6 @@ void setup() {
   Serial8.begin(9600);
   //while (!Serial8);
   
-  
   // LoRa Init
   if (!rf95.init())
     Serial.println("init failed");
@@ -239,8 +256,6 @@ void setup() {
 
   Serial.println("Initialization Complete.");
   Serial.println("SMORRT Ready for flight.");
-
-  
 }
 
 
@@ -264,7 +279,8 @@ void loop() {
   lora_tx_handle();
 
   // SD Log
-  logData();
+  if(logging_enable)
+   logData();
 
   heartbeat();
   delay(1000);  
@@ -533,37 +549,92 @@ void lora_tx_handle(){
 void state_update(void){
   switch(current_state){
     case IDLE:
-      ematch_disarm();
-      //if Telemetry command or vertical for a little while -> current_state = ARMED;
+      if(first_execute){
+        ematch_disarm();
+        logging_enable = false;
+        first_execute = false;
+      }
+      // if Telemetry command or vertical for a little while -> current_state = ARMED;
+
+      // Liftoff Detection
+      if(liftoff_detect()){
+        current_state = P_ASCENT;
+        timer_event_1.begin(safety_timer_event_1_handle, (EVENT_1_TIMER-LIFTOFF_DELAY)*1000000);
+        timer_event_2.begin(safety_timer_event_2_handle, (EVENT_2_TIMER-LIFTOFF_DELAY)*1000000);
+      }
+      first_execute = true;
       break;
     case ARMED:
-      ematch_arm();
-    // if liftoff detection -> current_state = 
+      if(first_execute){
+        ematch_arm();
+        logging_enable = true;
+        first_execute = false;
+      }
+
+      // Liftoff Detection
+      if(liftoff_detect()){
+        current_state = P_ASCENT;
+        timer_event_1.begin(safety_timer_event_1_handle, (EVENT_1_TIMER-LIFTOFF_DELAY)*1000000);
+        timer_event_2.begin(safety_timer_event_2_handle, (EVENT_2_TIMER-LIFTOFF_DELAY)*1000000);
+      }
+      first_execute = true;
       break;
     case P_ASCENT:
       //if Sensor detection or burn timer -> current_state = B_ASCENT
+      first_execute = true;
       break;
     case B_ASCENT:
       //apogee detection or safety timer -> current_state = EVENT_1
+      first_execute = true;
       break;
     case EVENT_1:
       ematch_trigger(EMATCH_1);
       ematch_trigger(EMATCH_2);
       //altitude detection + safety timer -> current_state = EVENT_2
+      first_execute = true;
       break;
     case EVENT_2:
       ematch_trigger(EMATCH_3);
       ematch_trigger(EMATCH_4);
       //no movement for a bit -> current_state = TOUCHDOWN
+      first_execute = true;
       break;
     case TOUCHDOWN:
       ematch_disarm();
       //log on SD then back to idle when done
+      first_execute = true;
       break;
     default: // ERROR
       //Error handling
+      first_execute = true;
       break;
   }
+}
+
+void safety_timer_event_1_handle(void){
+}
+
+void safety_timer_event_2_handle(void){
+}
+
+uint8_t liftoff_detect(void){
+
+  if((accel_data.z > LIFTOFF_THRESHOLD) && liftoff_delay == false){
+  liftoff_timer = millis();
+  liftoff_delay = true;
+  }
+  if((millis() - liftoff_timer > LIFTOFF_DELAY) && (accel_data.z > LIFTOFF_THRESHOLD) && (liftoff_delay = true)){
+    liftoff_status = true;
+  }
+  else{
+    liftoff_status = false;
+  }
+  return liftoff_status;
+}
+
+uint8_t apogee_detect(void){
+
+  return apogee_status;
 }
 
 void ematch_test(void){
@@ -732,8 +803,6 @@ static void printStr(const char *str, int len)
   smartDelay(0);
 }
 
-
-
 void logData() {
   // open the file. note that only one file can be open at a time,
   // so you have to close this one before opening another.
@@ -780,6 +849,8 @@ void logData() {
     myFile.print(ematch_4_status);
     myFile.print(" ; ");
     myFile.print(gps.satellites.value());
+    myFile.print(" ; ");
+    myFile.print(gps.hdop.value());
     myFile.print(" ; ");
     myFile.print(gps.location.lng());
     myFile.print(" ; ");
