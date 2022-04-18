@@ -69,14 +69,6 @@
 // IMU: I2C0
 
 // ======================================================== State Machine ========================================================
-// State 1: IDLE
-// State 2: ARMED
-// State 3: P_ASCENT
-// State 4: B_ASCENT
-// State 5: EVENT_1
-// State 6: EVENT_2
-// State 7: TOUCHDOWN
-
 #define IDLE                  (1)
 #define ARMED                 (2)
 #define P_ASCENT              (3)
@@ -84,6 +76,10 @@
 #define EVENT_1               (5)
 #define EVENT_2               (6)
 #define TOUCHDOWN             (7)
+
+// ======================================================== LoRa Commands ========================================================
+#define LORA_ARM              (0xA0)
+#define LORA_RESET            (0xFF)
 
 // ======================================================== Structures ========================================================
 struct ACCEL
@@ -176,8 +172,8 @@ void BMP_init(void);
 void BMP_read(void);
 void lora_packet_build(void);
 void lora_tx_handle(void);
-void sendByte(byte b);
-void sendPacket(byte *packet, byte len);
+void lora_rx_handle(void);
+void lora_parse(uint8_t *buffer);
 void GPS_read(void);
 void state_update(void);
 void safety_timer_event_1_handle(void);
@@ -546,6 +542,54 @@ void lora_tx_handle(){
   delay(400);
 }
 
+void lora_rx_handle(){
+
+  if (rf95.available())
+  {
+    // Should be a message for us now   
+    uint8_t buf[RH_RF95_MAX_MESSAGE_LEN];
+    uint8_t len = sizeof(buf);
+    if (rf95.recv(buf, &len))
+    {
+      digitalWrite(TE_RX_LED_PIN, HIGH);
+//      RH_RF95::printBuffer("request: ", buf, len);
+      Serial.print("got request: ");
+      Serial.println((char*)buf);
+      Serial.print("RSSI: ");
+      Serial.println(rf95.lastRssi(), DEC);
+      
+      lora_parse(buf);
+
+      // Send a reply
+      uint8_t data[] = "ACK";
+      rf95.send(data, sizeof(data));
+      rf95.waitPacketSent();
+      Serial.println("Sent ACK");
+      digitalWrite(TE_RX_LED_PIN, LOW);
+    }
+    else
+    {
+      Serial.println("recv failed");
+    }
+  }
+}
+
+void lora_parse(uint8_t *buffer){
+  switch(buffer[0]){
+    case LORA_ARM:
+      current_state = ARMED;
+      break;
+    
+    case LORA_RESET:
+      SCB_AIRCR = 0x05FA0004;
+      asm volatile ("dsb");
+      break;
+
+    default:
+      break;
+  }
+}
+
 void state_update(void){
   switch(current_state){
     case IDLE:
@@ -619,6 +663,8 @@ void state_update(void){
     default: // ERROR
       //Error handling
       first_execute = true;
+      SCB_AIRCR = 0x05FA0004;
+      asm volatile ("dsb");
       break;
   }
 }
