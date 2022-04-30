@@ -51,15 +51,17 @@
 #define LOCAL_PRESSURE        (1013.25)   // hPa
 
 // Flight Parameters
-#define EVENT_1_TIMER         (0)         // seconds
-#define EVENT_2_TIMER         (0)         // seconds
-#define EVENT_2_ALT           (0)          // meters
+#define EVENT_1_TIMER         (10000)     // seconds
+#define EVENT_2_TIMER         (20000)     // seconds
+#define EVENT_2_ALT           (0)         // meters
+#define MOTOR_BURNOUT         (5000)      // milliseconds
+#define MACH_DELAY            (5000)      // milliseconds
 
-// Threshold and Delay Defines
-#define LIFTOFF_THRESHOLD     (3)         // g's
-#define LIFTOFF_DELAY         (500)       // milliseconds
-#define MACH_DELAY            (0)         // seconds
-
+// Thresholds and Delay Defines
+#define LIFTOFF_THRESHOLD     (0)         // m/s2
+#define LIFTOFF_DELAY         (100)       // milliseconds
+#define GROUND_ALT_THRESHOLD  (20)        // meters
+#define TOUCHDOWN_DELAY       (10000)     // milliseconds
 
 // ======================================================== Hardware Interfaces ========================================================
 // LoRa: SPI1
@@ -128,7 +130,7 @@ Adafruit_BMP280 bmp(BMP_CS);
 TinyGPSPlus gps;
 
 //State Machine Variables
-uint8_t current_state = 0;
+uint8_t current_state = IDLE;
 
 //Battery Levels
 float v_batt1;
@@ -142,18 +144,21 @@ uint8_t ematch_3_status;
 uint8_t ematch_4_status;
 
 // Timers
-IntervalTimer timer_event_1;
-IntervalTimer timer_event_2;
-IntervalTimer timer_misc;
+uint32_t timer_burnout_init = 0;
+uint32_t timer_event_1_init = 0;
+uint32_t timer_event_2_init = 0;
 
 // Misc. Variables
-uint8_t liftoff_delay = false;
+uint32_t liftoff_delay = false;
 uint32_t liftoff_timer = 0;
 uint8_t liftoff_status = 0;
 uint8_t apogee_status = 0;
+uint32_t touchdown_delay = 0;
+uint32_t touchdown_timer = 0;
 uint8_t touchdown_status = 0;
 uint8_t first_execute = true;
 uint8_t logging_enable = false;
+uint16_t ground_altitude = 0;
 
 // Sensor Variables
 ACCEL accel_data;
@@ -221,9 +226,9 @@ void setup() {
   pinMode(EMATCH_4, OUTPUT);
 
   Serial.begin(115200);
-  //while (!Serial);
+  while (!Serial);
   Serial8.begin(9600);
-  //while (!Serial8);
+  while (!Serial8);
   
   // LoRa Init
   if (!rf95.init())
@@ -274,6 +279,7 @@ void loop() {
   // LoRa Handle
   lora_packet_build();
   lora_tx_handle();
+  lora_rx_handle();
 
   // SD Log
   if(logging_enable)
@@ -539,7 +545,7 @@ void lora_tx_handle(){
   {
     Serial.println("No reply, is GRUND running?");
   }
-  delay(400);
+  delay(100);
 }
 
 void lora_rx_handle(){
@@ -591,22 +597,28 @@ void lora_parse(uint8_t *buffer){
 }
 
 void state_update(void){
+
+  Serial.print("Current State: ");
+  Serial.println(current_state);
   switch(current_state){
     case IDLE:
       if(first_execute){
         ematch_disarm();
+        ground_altitude = bmp.readAltitude(LOCAL_PRESSURE);
         logging_enable = false;
         first_execute = false;
       }
       // if Telemetry command or vertical for a little while -> current_state = ARMED;
-
       // Liftoff Detection
       if(liftoff_detect()){
         current_state = P_ASCENT;
-        timer_event_1.begin(safety_timer_event_1_handle, (EVENT_1_TIMER-LIFTOFF_DELAY)*1000000);
-        timer_event_2.begin(safety_timer_event_2_handle, (EVENT_2_TIMER-LIFTOFF_DELAY)*1000000);
+        first_execute = true;
+        timer_event_1_init = millis();
+        timer_event_2_init = millis();
+        ematch_arm();
+        logging_enable = true;
       }
-      first_execute = true;
+      
       break;
     case ARMED:
       if(first_execute){
@@ -618,21 +630,32 @@ void state_update(void){
       // Liftoff Detection
       if(liftoff_detect()){
         current_state = P_ASCENT;
-        timer_event_1.begin(safety_timer_event_1_handle, (EVENT_1_TIMER-LIFTOFF_DELAY)*1000000);
-        timer_event_2.begin(safety_timer_event_2_handle, (EVENT_2_TIMER-LIFTOFF_DELAY)*1000000);
+        first_execute = true;
+        timer_event_1_init = millis();
+        timer_event_2_init = millis();
       }
-      first_execute = true;
       break;
     case P_ASCENT:
-      //if Sensor detection or burn timer -> current_state = B_ASCENT
-      first_execute = true;
+      if(first_execute){
+          timer_burnout_init = millis();
+          first_execute = false;
+        }
+      if((millis() - timer_burnout_init) > MOTOR_BURNOUT){
+        current_state = B_ASCENT;
+        first_execute = true;
+      }
+      //if apogee detection or burn timer -> current_state = B_ASCENT
       break;
     case B_ASCENT:
       //apogee detection or safety timer -> current_state = EVENT_1
       if(apogee_detect()){
         current_state = EVENT_1;
+        first_execute = true;
       }
-      first_execute = true;
+      else if((millis() - timer_event_1_init) > EVENT_1_TIMER){
+        current_state = EVENT_1;
+        first_execute = true;
+      }
       break;
     case EVENT_1:
       if(first_execute){
@@ -641,10 +664,14 @@ void state_update(void){
         first_execute = false;
       }
       //altitude detection + safety timer -> current_state = EVENT_2
-      if(est_altitude < EVENT_2_ALT){
+      if(est_altitude <= EVENT_2_ALT){
         current_state = EVENT_2;
+        first_execute = true;
       }
-      first_execute = true;
+      else if((millis() - timer_event_2_init) > EVENT_2_TIMER){
+        current_state = EVENT_2;
+        first_execute = true;
+      }
       break;
     case EVENT_2:
       if(first_execute){
@@ -652,13 +679,16 @@ void state_update(void){
         ematch_trigger(EMATCH_4);
         first_execute = false;
       }
+      if(touchdown_detect()){
+        current_state = TOUCHDOWN;
+        first_execute = true;
+      }
       //no movement for a bit -> current_state = TOUCHDOWN
-      first_execute = true;
       break;
     case TOUCHDOWN:
       ematch_disarm();
+      logging_enable = false;
       //log on SD then back to idle when done
-      first_execute = true;
       break;
     default: // ERROR
       //Error handling
@@ -669,22 +699,13 @@ void state_update(void){
   }
 }
 
-void safety_timer_event_1_handle(void){
-  current_state = EVENT_1;
-}
-
-void safety_timer_event_2_handle(void){
-  current_state = EVENT_2;
-
-}
-
 uint8_t liftoff_detect(void){
 
-  if((accel_data.z > LIFTOFF_THRESHOLD) && liftoff_delay == false){
+  if((accel_data.y < LIFTOFF_THRESHOLD) && liftoff_delay == false){
   liftoff_timer = millis();
   liftoff_delay = true;
   }
-  if((millis() - liftoff_timer > LIFTOFF_DELAY) && (accel_data.z > LIFTOFF_THRESHOLD) && (liftoff_delay = true)){
+  if((millis() - liftoff_timer > LIFTOFF_DELAY) && (accel_data.y < LIFTOFF_THRESHOLD) && (liftoff_delay = true)){
     liftoff_status = true;
   }
   else{
@@ -699,7 +720,16 @@ uint8_t apogee_detect(void){
 }
 
 uint8_t touchdown_detect(void){
-
+  if((abs(est_altitude - ground_altitude) < GROUND_ALT_THRESHOLD) && (touchdown_delay == false)){
+  touchdown_timer = millis();
+  touchdown_delay = true;
+  }
+  if((millis() - touchdown_timer > TOUCHDOWN_DELAY) && (abs(est_altitude - ground_altitude) < GROUND_ALT_THRESHOLD) && (touchdown_delay = true)){
+    touchdown_status = true;
+  }
+  else{
+    touchdown_status = false;
+  }
   return touchdown_status;
 }
 
@@ -783,7 +813,7 @@ void GPS_read(void){
   Serial.println();
   digitalWrite(GPS_RX_LED_PIN, LOW);
 
-  smartDelay(1000);
+  smartDelay(100);
 
   if (millis() > 5000 && gps.charsProcessed() < 10)
     Serial.println(F("No GPS data received: check wiring"));
@@ -869,7 +899,7 @@ static void printStr(const char *str, int len)
   smartDelay(0);
 }
 
-void logData() {
+void logData(){
   // open the file. note that only one file can be open at a time,
   // so you have to close this one before opening another.
   myFile = SD.open("log_Cernier.txt", FILE_WRITE);
